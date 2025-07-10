@@ -8,10 +8,19 @@
 (define-constant err-already-exists (err u102))
 (define-constant err-invalid-rating (err u103))
 (define-constant err-unauthorized (err u104))
+(define-constant err-insufficient-funds (err u105))
+(define-constant err-transfer-failed (err u106))
+
+;; Reward constants
+(define-constant high-quality-review-threshold u4)
+(define-constant reviewer-reward-amount u1000000)
+(define-constant loyalty-reward-amount u500000)
+(define-constant min-reviews-for-reward u3)
 
 ;; Data Variables with bounds checking
 (define-data-var next-restaurant-id uint u1)
 (define-data-var next-review-id uint u1)
+(define-data-var reward-pool uint u0)
 
 ;; Additional constants for validation
 (define-constant max-uint u340282366920938463463374607431768211455)
@@ -45,6 +54,25 @@
 (define-map user-reviews
   { reviewer: principal, restaurant-id: uint }
   { review-id: uint }
+)
+
+(define-map reviewer-stats
+  { reviewer: principal }
+  {
+    total-reviews: uint,
+    high-quality-reviews: uint,
+    total-rewards-earned: uint,
+    last-reward-block: uint
+  }
+)
+
+(define-map restaurant-loyalty
+  { restaurant-id: uint, customer: principal }
+  {
+    visit-count: uint,
+    total-rewards: uint,
+    last-visit-block: uint
+  }
 )
 
 ;; Public Functions
@@ -132,6 +160,59 @@
         )
       )
       
+      ;; Update reviewer stats and check for rewards
+      (let (
+        (current-reviewer-stats (default-to 
+          { total-reviews: u0, high-quality-reviews: u0, total-rewards-earned: u0, last-reward-block: u0 }
+          (map-get? reviewer-stats { reviewer: tx-sender })
+        ))
+        (new-total-reviews (+ (get total-reviews current-reviewer-stats) u1))
+        (is-high-quality (>= rating high-quality-review-threshold))
+        (new-high-quality-count (if is-high-quality 
+          (+ (get high-quality-reviews current-reviewer-stats) u1)
+          (get high-quality-reviews current-reviewer-stats)
+        ))
+      )
+        (map-set reviewer-stats
+          { reviewer: tx-sender }
+          (merge current-reviewer-stats {
+            total-reviews: new-total-reviews,
+            high-quality-reviews: new-high-quality-count
+          })
+        )
+        
+        ;; Award reviewer reward for high-quality reviews
+        (and (if (and is-high-quality (>= new-total-reviews min-reviews-for-reward))
+       (try! (distribute-reviewer-reward tx-sender))
+       true
+     )
+     true)
+      )
+      
+      ;; Update restaurant loyalty for customer
+      (let (
+        (current-loyalty (default-to
+          { visit-count: u0, total-rewards: u0, last-visit-block: u0 }
+          (map-get? restaurant-loyalty { restaurant-id: restaurant-id, customer: tx-sender })
+        ))
+        (new-visit-count (+ (get visit-count current-loyalty) u1))
+      )
+        (map-set restaurant-loyalty
+          { restaurant-id: restaurant-id, customer: tx-sender }
+          (merge current-loyalty {
+            visit-count: new-visit-count,
+            last-visit-block: stacks-block-height
+          })
+        )
+        
+        ;; Award loyalty reward for frequent customers
+        (and (if (and (> new-visit-count u2) (is-eq (mod new-visit-count u5) u0))
+       (try! (distribute-loyalty-reward tx-sender restaurant-id))
+       true
+     )
+     true)
+      )
+      
       (var-set next-review-id (+ review-id u1))
       (ok review-id)
     )
@@ -150,6 +231,71 @@
         (merge restaurant { is-active: (not (get is-active restaurant)) })
       )
       (ok true)
+    )
+  )
+)
+
+;; Reward system functions
+
+;; Fund the reward pool (owner only)
+(define-public (fund-reward-pool (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((current-pool (var-get reward-pool)))
+      ;; Check for overflow before adding
+      (asserts! (<= amount (- max-uint current-pool)) err-invalid-rating)
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (var-set reward-pool (+ current-pool amount))
+      (ok true)
+    )
+  )
+)
+
+;; Distribute reviewer reward
+(define-private (distribute-reviewer-reward (reviewer principal))
+  (let ((current-pool (var-get reward-pool)))
+    (if (>= current-pool reviewer-reward-amount)
+      (begin
+        (try! (as-contract (stx-transfer? reviewer-reward-amount tx-sender reviewer)))
+        (var-set reward-pool (- current-pool reviewer-reward-amount))
+        (let (
+          (current-stats (unwrap! (map-get? reviewer-stats { reviewer: reviewer }) err-not-found))
+        )
+          (map-set reviewer-stats
+            { reviewer: reviewer }
+            (merge current-stats {
+              total-rewards-earned: (+ (get total-rewards-earned current-stats) reviewer-reward-amount),
+              last-reward-block: stacks-block-height
+            })
+          )
+        )
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+;; Distribute loyalty reward
+(define-private (distribute-loyalty-reward (customer principal) (restaurant-id uint))
+  (let ((current-pool (var-get reward-pool)))
+    (if (>= current-pool loyalty-reward-amount)
+      (begin
+        (try! (as-contract (stx-transfer? loyalty-reward-amount tx-sender customer)))
+        (var-set reward-pool (- current-pool loyalty-reward-amount))
+        (let (
+          (current-loyalty (unwrap! (map-get? restaurant-loyalty { restaurant-id: restaurant-id, customer: customer }) err-not-found))
+        )
+          (map-set restaurant-loyalty
+            { restaurant-id: restaurant-id, customer: customer }
+            (merge current-loyalty {
+              total-rewards: (+ (get total-rewards current-loyalty) loyalty-reward-amount)
+            })
+          )
+        )
+        (ok true)
+      )
+      (ok false)
     )
   )
 )
@@ -185,4 +331,22 @@
 ;; Get current review ID counter
 (define-read-only (get-next-review-id)
   (var-get next-review-id)
+)
+
+;; Get reviewer statistics
+(define-read-only (get-reviewer-stats (reviewer principal))
+  (map-get? reviewer-stats { reviewer: reviewer })
+)
+
+;; Get restaurant loyalty information
+(define-read-only (get-loyalty-info (restaurant-id uint) (customer principal))
+  (if (and (> restaurant-id u0) (< restaurant-id (var-get next-restaurant-id)))
+    (map-get? restaurant-loyalty { restaurant-id: restaurant-id, customer: customer })
+    none
+  )
+)
+
+;; Get current reward pool balance
+(define-read-only (get-reward-pool)
+  (var-get reward-pool)
 )
